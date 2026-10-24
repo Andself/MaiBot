@@ -15,6 +15,40 @@ def _fake_global_config(**integration_values):
     )
 
 
+def test_person_fact_source_labels_preserve_introduction_author(monkeypatch):
+    monkeypatch.setattr(memory_flow_module, "is_bot_self", lambda platform, uid: uid == "bot")
+    user = SimpleNamespace(platform="weixin_ilink", user_id="owner", message_id="intro",
+        processed_plain_text="他叫李四，是我的朋友，他喜欢DOTA。",
+        message_info=SimpleNamespace(user_info=SimpleNamespace(user_id="owner", user_nickname="张三")))
+    service = memory_flow_module.PersonFactWritebackService
+    line = service._format_evidence_message_line(user, include_sender=True)
+    source = json.loads(line)
+    assert source["sender_id"] == "owner"
+    assert source["sender_name"] == "张三"
+    assert source["speaker_role"] == "external_sender"
+    assert source["original_text"] == user.processed_plain_text
+    user.user_id = "bot"
+    user.message_info.user_info.user_id = "bot"
+    assert json.loads(service._format_evidence_message_line(user, include_sender=True))["speaker_role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_person_fact_extraction_prompt_separates_speaker_friend_and_bot():
+    prompts = []
+    class Extractor:
+        async def generate_response(self, prompt):
+            prompts.append(prompt)
+            return SimpleNamespace(response="[]")
+    service = memory_flow_module.PersonFactWritebackService()
+    service._extractor = Extractor()
+    result = await service._extract_facts(SimpleNamespace(person_name="张三", person_id="person-owner"),
+        "我记住你朋友的介绍了", '张三：他叫李四，是我的朋友，喜欢DOTA')
+    assert result == []
+    assert "真实发送者" in prompts[0]
+    assert "不能把被介绍朋友的职业" in prompts[0]
+    assert "不能反写成发送者有哥哥" in prompts[0]
+
+
 def test_person_fact_parse_fact_list_deduplicates_and_filters_short_items():
     raw = '["他喜欢猫", "他喜欢猫", "好", "", "他会弹吉他"]'
 
@@ -203,7 +237,9 @@ def test_person_fact_reply_evidence_keeps_context_for_short_answer(monkeypatch):
     assert "目标用户原始发言" in evidence_text
     assert "青霉素。" in evidence_text
     assert "邻近上下文" in evidence_text
-    assert "麦麦: 你对什么过敏？" in evidence_text
+    assert '"sender_name": "麦麦"' in evidence_text
+    assert '"speaker_role": "assistant"' in evidence_text
+    assert '"original_text": "你对什么过敏？"' in evidence_text
 
 
 @pytest.mark.asyncio
