@@ -15,12 +15,130 @@ def _fake_global_config(**integration_values):
     )
 
 
+def test_person_fact_source_labels_preserve_introduction_author(monkeypatch):
+    monkeypatch.setattr(memory_flow_module, "is_bot_self", lambda platform, uid: uid == "bot")
+    user = SimpleNamespace(
+        platform="qq",
+        user_id="owner",
+        message_id="intro",
+        processed_plain_text="他叫李四，是我的朋友，他喜欢音乐。",
+        message_info=SimpleNamespace(user_info=SimpleNamespace(user_id="owner", user_nickname="张三")),
+    )
+    service = memory_flow_module.PersonFactWritebackService
+    line = service._format_evidence_message_line(user, include_sender=True)
+    source = json.loads(line)
+    assert source["sender_id"] == "owner"
+    assert source["sender_name"] == "张三"
+    assert source["speaker_role"] == "external_sender"
+    assert source["original_text"] == user.processed_plain_text
+    # 相同显示名不会覆盖消息来源中的真实用户 ID。
+    user.user_id = "another-user"
+    user.message_info.user_info.user_id = "another-user"
+    assert json.loads(service._format_evidence_message_line(user, include_sender=True))["sender_id"] == "another-user"
+    user.user_id = "bot"
+    user.message_info.user_info.user_id = "bot"
+    assert json.loads(service._format_evidence_message_line(user, include_sender=True))["speaker_role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_person_fact_extraction_prompt_separates_speaker_friend_and_bot():
+    prompts = []
+
+    class Extractor:
+        async def generate_response(self, prompt):
+            prompts.append(prompt)
+            return SimpleNamespace(response="[]")
+
+    service = memory_flow_module.PersonFactWritebackService()
+    service._extractor = Extractor()
+    result = await service._extract_facts(
+        SimpleNamespace(person_name="张三", person_id="person-owner"),
+        "我记住你朋友的介绍了",
+        "张三：他叫李四，是我的朋友，喜欢音乐",
+    )
+    assert result == []
+    assert "真实发送者" in prompts[0]
+    assert "被介绍者的职业、喜好和经历不属于介绍者" in prompts[0]
+    assert "不能交换关系的主体与客体" in prompts[0]
+
+
 def test_person_fact_parse_fact_list_deduplicates_and_filters_short_items():
     raw = '["他喜欢猫", "他喜欢猫", "好", "", "他会弹吉他"]'
 
     result = memory_flow_module.PersonFactWritebackService._parse_fact_list(raw)
 
     assert result == ["他喜欢猫", "他会弹吉他"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_to,target_id", [("a-message", "a"), ("", "b")])
+async def test_group_writeback_preserves_target_identity_with_same_display_names(monkeypatch, reply_to, target_id):
+    def message(mid, uid, text):
+        return SimpleNamespace(
+            message_id=mid,
+            platform="qq",
+            user_id=uid,
+            processed_plain_text=text,
+            message_info=SimpleNamespace(
+                user_info=SimpleNamespace(user_id=uid, user_nickname="同名成员", user_cardname="")
+            ),
+        )
+
+    first = message("a-message", "a", '我喜欢音乐。\n他说“我喜欢运动”。')
+    second = message("b-message", "b", "我喜欢绘画。")
+    bot = message("bot-message", "bot", "我记住了你们的爱好。")
+
+    class FakePerson:
+        def __init__(self, person_id):
+            self.person_id = person_id
+            self.person_name = "同名成员"
+            self.is_known = person_id in {"qq:a", "qq:b"}
+
+    def find_messages(**kwargs):
+        if kwargs.get("message_id"):
+            return [first] if kwargs["message_id"] == "a-message" else []
+        assert kwargs["session_id"] == "group-session"
+        return [first, second] if kwargs.get("filter_bot") else [first, second, bot]
+
+    monkeypatch.setattr(memory_flow_module, "find_messages", find_messages)
+    monkeypatch.setattr(memory_flow_module, "Person", FakePerson)
+    monkeypatch.setattr(memory_flow_module, "is_bot_self", lambda platform, uid: uid == "bot")
+    monkeypatch.setattr(memory_flow_module, "get_person_id", lambda platform, uid: f"{platform}:{uid}")
+    stored = []
+    prompts = []
+
+    async def store(name, fact, session_id, **kwargs):
+        stored.append((session_id, kwargs))
+
+    class Extractor:
+        async def generate_response(self, prompt):
+            prompts.append(prompt)
+            fact = "同名成员喜欢音乐。" if target_id == "a" else "同名成员喜欢绘画。"
+            return SimpleNamespace(response=json.dumps([{"fact": fact}]))
+
+    monkeypatch.setattr(memory_flow_module, "store_person_memory_from_answer", store)
+    service = memory_flow_module.PersonFactWritebackService()
+    service._extractor = Extractor()
+    trigger = SimpleNamespace(
+        processed_plain_text="我记住了你刚刚介绍的个人爱好。",
+        session_id="group-session",
+        timestamp=20.0,
+        reply_to=reply_to,
+        session=SimpleNamespace(platform="qq", user_id="bot", group_id="group", session_id="group-session"),
+    )
+    await service._handle_message(trigger)
+    assert len(stored) == 1
+    assert stored[0][0] == "group-session"
+    assert stored[0][1]["person_id"] == f"qq:{target_id}"
+    assert stored[0][1]["evidence_message_ids"] == [f"{target_id}-message"]
+    target_section = prompts[0].split("目标用户原始发言（事实值必须来自这里）：\n", 1)[1].split("\n\n", 1)[0]
+    assert f'"sender_id": "{target_id}"' in target_section
+    other_id = "b" if target_id == "a" else "a"
+    assert f'"sender_id": "{other_id}"' not in target_section
+    assert '"sender_id": "bot"' not in target_section
+    if target_id == "a":
+        # JSON quoting preserves a multiline body containing another speaker's quotation.
+        assert json.dumps(first.processed_plain_text, ensure_ascii=False) in target_section
 
 
 def test_person_fact_looks_ephemeral_detects_short_chitchat():
@@ -203,7 +321,9 @@ def test_person_fact_reply_evidence_keeps_context_for_short_answer(monkeypatch):
     assert "目标用户原始发言" in evidence_text
     assert "青霉素。" in evidence_text
     assert "邻近上下文" in evidence_text
-    assert "麦麦: 你对什么过敏？" in evidence_text
+    assert '"sender_name": "麦麦"' in evidence_text
+    assert '"speaker_role": "assistant"' in evidence_text
+    assert '"original_text": "你对什么过敏？"' in evidence_text
 
 
 @pytest.mark.asyncio

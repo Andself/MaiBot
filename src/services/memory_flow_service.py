@@ -339,7 +339,7 @@ class PersonFactWritebackService:
     def _format_user_evidence(evidence: PersonFactEvidence) -> str:
         target_lines: List[str] = []
         for item in evidence.target_messages[:3]:
-            line = PersonFactWritebackService._format_evidence_message_line(item, include_sender=False)
+            line = PersonFactWritebackService._format_evidence_message_line(item, include_sender=True, mark_target=True)
             if line:
                 message_id = str(item.message_id or "").strip()
                 target_lines.append(f"- [消息ID: {message_id}] {line}" if message_id else f"- {line}")
@@ -384,9 +384,20 @@ class PersonFactWritebackService:
             or getattr(item, "user_id", "")
             or ""
         ).strip()
-        prefix = f"{sender_name}: " if sender_name else ""
+        platform = str(getattr(item, "platform", "") or "").strip()
+        sender_id = str(getattr(user_info, "user_id", "") or getattr(item, "user_id", "") or "").strip()
+        # 来源标签读取消息元数据；正文单独序列化，保留说话人与被描述者的区别。
+        is_assistant = bool(platform and sender_id and is_bot_self(platform, sender_id))
+        source = {
+            "sender_name": sender_name,
+            "platform": platform,
+            "sender_id": sender_id,
+            "speaker_role": "assistant" if is_assistant else "external_sender",
+            "original_text": text,
+        }
+        prefix = json.dumps(source, ensure_ascii=False)
         target_marker = " [目标用户发言]" if mark_target else ""
-        return f"{prefix}{text}{target_marker}"
+        return f"{prefix}{target_marker}"
 
     async def _extract_facts(self, person: Person, reply_text: str, user_evidence_text: str) -> List[Any]:
         person_name = str(getattr(person, "person_name", "") or getattr(person, "nickname", "") or person.person_id)
@@ -404,9 +415,12 @@ class PersonFactWritebackService:
 2. 明确是关于目标人物本人的信息。
 3. 具有相对稳定性，可以作为长期记忆保存。
 4. 用简洁中文陈述句表达。
-5. 如果用户原始发言中出现“我/我的/自己”，默认指目标人物，请先改写成关于目标人物的第三人称事实再输出。
+5. 根据消息来源标签确认真实发送者。用户原话中的“我/我的/自己”指发送者；引用或转达按第8条处理。
+   确认描述的是目标人物本人后，用目标人物的称呼改写事实；描述其他人的内容不提取。
 6. 邻近上下文只能用于补全目标用户短答、省略、被追问的问题或代词指向。例如上下文问“你对什么过敏？”，目标用户答“青霉素”，可以提取“目标人物对青霉素过敏”。
 7. 如果完整事实只能靠机器人回复或邻近上下文中的新增事实值成立，而目标用户原始发言没有确认或给出该事实值，不要提取。
+8. 引用、转达、人物介绍中的第一人称按原始发言者解释；原始发言者不明确时不提取。被介绍者的职业、喜好和经历不属于介绍者，也不属于机器人。
+9. 关系事实必须明确双方及方向。不能交换关系的主体与客体；称呼不一致或指代不明确时不猜测、不合并人物。
 
 不要提取：
 - 机器人的情绪、计划、临时动作、客套话
